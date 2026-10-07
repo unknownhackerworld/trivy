@@ -19,6 +19,7 @@ import (
 	"github.com/samber/lo"
 	"golang.org/x/xerrors"
 
+	npmver "github.com/aquasecurity/go-npm-version/pkg"
 	"github.com/aquasecurity/trivy/pkg/dependency"
 	"github.com/aquasecurity/trivy/pkg/dependency/parser/nodejs/packagejson"
 	"github.com/aquasecurity/trivy/pkg/dependency/parser/nodejs/yarn"
@@ -39,9 +40,73 @@ func init() {
 
 const version = 2
 
-// Taken from Yarn
-// cf. https://github.com/yarnpkg/yarn/blob/328fd596de935acc6c3e134741748fcc62ec3739/src/resolvers/exotics/registry-resolver.js#L12
-var fragmentRegexp = regexp.MustCompile(`(\S+):(@?.*?)(@(.*?)|)$`)
+var (
+	// protocolRegexp matches a protocol prefix in a dependency range, such as `npm:`, `workspace:` or `https:`.
+	protocolRegexp = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.-]*):`)
+
+	// descriptorRegexp matches `name@range`, where the range is required.
+	// cf. https://github.com/yarnpkg/berry/blob/e4e423a1eb117b5129f20ac626a03eb7a97aedff/packages/yarnpkg-core/sources/structUtils.ts#L382
+	descriptorRegexp = regexp.MustCompile(`^((?:@[^/]+?/)?[^@/]+?)@(.+)$`)
+
+	// packageNameRegexp matches `name` or `@scope/name` without a range.
+	packageNameRegexp = regexp.MustCompile(`^(?:@[^/@]+/)?[^/@]+$`)
+)
+
+// rangeKind describes how a dependency range from package.json should be handled.
+type rangeKind int
+
+const (
+	// rangeNpm is a range that is resolved from the npm registry and can be matched against yarn.lock.
+	rangeNpm rangeKind = iota
+	// rangeWorkspace is a reference to another workspace through the `workspace:` protocol.
+	rangeWorkspace
+	// rangeOther is a range with any other protocol (e.g. `file:`, `link:`, `https:`).
+	rangeOther
+)
+
+// parseRange interprets a dependency range from package.json the way Yarn does.
+// It returns the name of the package that is actually installed (which differs from `name` for aliases)
+// and the range to compare against the version from yarn.lock.
+//
+// Yarn v1 selects a resolver by the range prefix and only parses an alias after `npm:` or `yarn:`:
+//   - https://github.com/yarnpkg/yarn/blob/328fd596de935acc6c3e134741748fcc62ec3739/src/resolvers/exotics/exotic-resolver.js#L8-L15
+//   - https://github.com/yarnpkg/yarn/blob/328fd596de935acc6c3e134741748fcc62ec3739/src/resolvers/exotics/registry-resolver.js#L12
+//
+// Yarn Berry handles `workspace:` with its own resolver and tries three resolvers for `npm:`
+// (alias, semver range, dist-tag):
+//   - https://github.com/yarnpkg/berry/blob/e4e423a1eb117b5129f20ac626a03eb7a97aedff/packages/yarnpkg-core/sources/WorkspaceResolver.ts#L10-L11
+//   - https://github.com/yarnpkg/berry/blob/e4e423a1eb117b5129f20ac626a03eb7a97aedff/packages/plugin-npm/sources/index.ts#L159-L161
+func (a yarnAnalyzer) parseRange(name, rng string) (string, string, rangeKind) {
+	m := protocolRegexp.FindStringSubmatch(rng)
+	if m == nil {
+		// No protocol, e.g. `^1.2.3`, `latest` or `1.2.3 - 2.0.0`.
+		return name, rng, rangeNpm
+	}
+
+	protocol := m[1]
+	rest := strings.TrimPrefix(rng, m[0])
+	switch protocol {
+	case "workspace":
+		return name, rest, rangeWorkspace
+	case "npm", "yarn":
+		// Alias with a range, e.g. `npm:debug@^4.3` or `npm:@types/jsonstream@0.8.33`.
+		if dm := descriptorRegexp.FindStringSubmatch(rest); dm != nil {
+			return dm[1], dm[2], rangeNpm
+		}
+		// A plain semver range with an explicit protocol, as Yarn Berry writes it, e.g. `npm:1.2.5` or `npm:^1.2.5`.
+		if _, err := npmver.NewConstraints(rest); err == nil {
+			return name, rest, rangeNpm
+		}
+		// Alias without a range, e.g. `npm:ms` or `npm:@types/uuid`.
+		// Yarn v1 resolves it to the latest version.
+		if packageNameRegexp.MatchString(rest) {
+			return rest, "", rangeNpm
+		}
+		return name, rest, rangeNpm
+	default:
+		return name, rest, rangeOther
+	}
+}
 
 type yarnAnalyzer struct {
 	logger            *log.Logger
@@ -288,12 +353,23 @@ func (a yarnAnalyzer) walkDependencies(parent *types.Package, pkgs map[string]ty
 			continue
 		}
 
-		// Handle aliases
+		// Handle protocols and aliases
 		// cf. https://classic.yarnpkg.com/lang/en/docs/cli/add/#toc-yarn-add-alias
-		if m := fragmentRegexp.FindStringSubmatch(constraint); len(m) == 5 {
-			pkg.Name = m[2] // original name
-			constraint = m[4]
+		name, constraint, kind := a.parseRange(pkg.Name, constraint)
+		switch kind {
+		case rangeWorkspace:
+			// A reference to another workspace (e.g. `workspace:*`).
+			// The workspace keeps its own name and relationship, and its dependencies are resolved separately,
+			// so only the dependency edge is added.
+			if pkg.Relationship == types.RelationshipWorkspace {
+				parent.DependsOn = append(parent.DependsOn, pkg.ID)
+			}
+			continue
+		case rangeOther:
+			// Packages from other sources (e.g. `file:`, `link:`, git or tarball URLs) are not matched with packages from the registry.
+			continue
 		}
+		pkg.Name = name
 
 		// Try to find an exact match to the pattern.
 		// In some cases, patterns from yarn.lock and package.json may not match (e.g., yarn v2 uses the allowed version for ID).
