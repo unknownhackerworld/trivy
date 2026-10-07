@@ -1008,6 +1008,77 @@ func Test_yarnLibraryAnalyzer_Analyze(t *testing.T) {
 				},
 			},
 		},
+		// Workspace `b` depends on workspace `a` through `workspace:*`.
+		// `a` has a version with a leading `v`, which is not a valid npm version.
+		// The root package uses an explicit `npm:` protocol for a plain version, as Yarn Berry writes it.
+		{
+			name: "workspace and npm protocols",
+			dir:  "testdata/workspace-protocol",
+			want: &analyzer.AnalysisResult{
+				Applications: []types.Application{
+					{
+						Type:     types.Yarn,
+						FilePath: "yarn.lock",
+						Packages: types.Packages{
+							{
+								ID:           "root@1.0.0",
+								Name:         "root",
+								Version:      "1.0.0",
+								Relationship: types.RelationshipRoot,
+								DependsOn: []string{
+									"a@v1.0.0",
+									"b@1.0.0",
+									"minimist@1.2.5",
+								},
+							},
+							{
+								ID:           "a@v1.0.0",
+								Name:         "a",
+								Version:      "v1.0.0",
+								Relationship: types.RelationshipWorkspace,
+								DependsOn: []string{
+									"is-number@7.0.0",
+								},
+							},
+							{
+								ID:           "b@1.0.0",
+								Name:         "b",
+								Version:      "1.0.0",
+								Relationship: types.RelationshipWorkspace,
+								DependsOn: []string{
+									"a@v1.0.0",
+								},
+							},
+							{
+								ID:           "is-number@7.0.0",
+								Name:         "is-number",
+								Version:      "7.0.0",
+								Relationship: types.RelationshipDirect,
+								Locations: []types.Location{
+									{
+										StartLine: 24,
+										EndLine:   28,
+									},
+								},
+							},
+							{
+								ID:           "minimist@1.2.5",
+								Name:         "minimist",
+								Version:      "1.2.5",
+								Dev:          true,
+								Relationship: types.RelationshipDirect,
+								Locations: []types.Location{
+									{
+										StartLine: 30,
+										EndLine:   34,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1081,6 +1152,42 @@ func Test_yarnLibraryAnalyzer_Required(t *testing.T) {
 			a := yarnAnalyzer{}
 			got := a.Required(tt.filePath, nil)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_yarnAnalyzer_parseRange(t *testing.T) {
+	tests := []struct {
+		name           string
+		depName        string
+		rng            string
+		wantName       string
+		wantConstraint string
+		wantKind       rangeKind
+	}{
+		{name: "semver range", depName: "debug", rng: "^4.3.4", wantName: "debug", wantConstraint: "^4.3.4", wantKind: rangeNpm},
+		{name: "dist-tag", depName: "debug", rng: "latest", wantName: "debug", wantConstraint: "latest", wantKind: rangeNpm},
+		{name: "npm protocol with version", depName: "minimist", rng: "npm:1.2.5", wantName: "minimist", wantConstraint: "1.2.5", wantKind: rangeNpm},
+		{name: "npm protocol with range", depName: "minimist", rng: "npm:^1.2.5", wantName: "minimist", wantConstraint: "^1.2.5", wantKind: rangeNpm},
+		{name: "alias with range", depName: "foo-debug", rng: "npm:debug@^4.3", wantName: "debug", wantConstraint: "^4.3", wantKind: rangeNpm},
+		{name: "scoped alias with version", depName: "foo-json", rng: "npm:@types/jsonstream@0.8.33", wantName: "@types/jsonstream", wantConstraint: "0.8.33", wantKind: rangeNpm},
+		{name: "alias without range", depName: "foo-ms", rng: "npm:ms", wantName: "ms", wantConstraint: "", wantKind: rangeNpm},
+		{name: "scoped alias without range", depName: "foo-uuid", rng: "npm:@types/uuid", wantName: "@types/uuid", wantConstraint: "", wantKind: rangeNpm},
+		{name: "yarn protocol alias", depName: "foo-debug", rng: "yarn:debug@^4.3", wantName: "debug", wantConstraint: "^4.3", wantKind: rangeNpm},
+		{name: "workspace star", depName: "a", rng: "workspace:*", wantName: "a", wantConstraint: "*", wantKind: rangeWorkspace},
+		{name: "workspace caret", depName: "a", rng: "workspace:^", wantName: "a", wantConstraint: "^", wantKind: rangeWorkspace},
+		{name: "workspace path", depName: "a", rng: "workspace:packages/a", wantName: "a", wantConstraint: "packages/a", wantKind: rangeWorkspace},
+		{name: "tarball url", depName: "foo", rng: "https://example.com/foo-1.0.0.tgz", wantName: "foo", wantConstraint: "//example.com/foo-1.0.0.tgz", wantKind: rangeOther},
+		{name: "file protocol", depName: "foo", rng: "file:../foo", wantName: "foo", wantConstraint: "../foo", wantKind: rangeOther},
+		{name: "link protocol", depName: "foo", rng: "link:../foo", wantName: "foo", wantConstraint: "../foo", wantKind: rangeOther},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := yarnAnalyzer{}
+			gotName, gotConstraint, gotKind := a.parseRange(tt.depName, tt.rng)
+			assert.Equal(t, tt.wantName, gotName)
+			assert.Equal(t, tt.wantConstraint, gotConstraint)
+			assert.Equal(t, tt.wantKind, gotKind)
 		})
 	}
 }
